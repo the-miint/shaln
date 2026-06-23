@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Test fixture: a fake `duckdb` that reports a supported version (>= 1.5.4).
+# Used by tests/run.sh to exercise shaln's duckdb discovery + version gate
+# without depending on a real duckdb build. Ignores all arguments.
+echo "v1.5.4 (Variegata) 08e34c447b"

@@ -1,0 +1,3 @@
+# Vendored DuckDB binary (installed by install.sh into $SHALN_HOME; discovered
+# by `shaln` as a fallback). Never commit the binary itself.
+/duckdb

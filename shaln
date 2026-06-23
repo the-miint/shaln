@@ -1,0 +1,902 @@
+#!/usr/bin/env bash
+#
+# shaln — sharded alignment as a duckdb + bash binary.
+#
+# A thin CLI over the duckdb-miint extension's sharded alignment table functions.
+# Its only runtime dependencies are `duckdb` (>= 1.5.4) and bash.
+#
+# Subcommands:
+#   index     Build a sharded alignment bundle from references + a shard map
+#   align     Align reads against a sharded bundle
+#   version   Print the shaln version
+#   help      Show usage
+#
+# Environment:
+#   SHALN_DUCKDB           Path to the duckdb binary (overrides discovery)
+#   SHALN_EXTENSION_PATH   Path to a local miint extension (loaded unsigned)
+#
+# The script is safe to `source` (for testing): it defines functions and only
+# runs `main` when executed directly.
+
+# Resolve our own location (used for the vendored-duckdb discovery fallback).
+SHALN_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SHALN_VERSION="0.1.0"
+SHALN_MIN_DUCKDB="1.5.4"
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+# shaln_err <message...> — print an error to stderr (no exit; for return-based flows).
+shaln_err() {
+  printf 'shaln: error: %s\n' "$*" >&2
+}
+
+# shaln_die <message...> — print an error to stderr and exit 1 (top-level paths only).
+shaln_die() {
+  shaln_err "$@"
+  exit 1
+}
+
+# shaln_arg_error <message...> — usage/argument error: stderr + exit 2.
+shaln_arg_error() {
+  shaln_err "$@"
+  exit 2
+}
+
+# shaln_log <message...> — a timestamped progress milestone to stderr, emitted
+# only under --verbose (SHALN_VERBOSE). Layer 1 of the verbose output.
+shaln_log() {
+  [[ -n "${SHALN_VERBOSE:-}" ]] || return 0
+  printf '[%s] shaln: %s\n' "$(date '+%H:%M:%S')" "$*" >&2
+}
+
+# ---------------------------------------------------------------------------
+# DuckDB discovery + version gate
+# ---------------------------------------------------------------------------
+
+# shaln_resolve_duckdb — print the duckdb binary path on stdout.
+# Order: $SHALN_DUCKDB, vendored $SHALN_HOME/duckdb, `duckdb` on PATH.
+# On failure: error to stderr, return 1. (Uses only builtins so it is robust
+# under a stripped PATH.)
+shaln_resolve_duckdb() {
+  if [[ -n "${SHALN_DUCKDB:-}" ]]; then
+    if [[ ! -x "$SHALN_DUCKDB" ]]; then
+      shaln_err "SHALN_DUCKDB is set to '$SHALN_DUCKDB' but it is not an executable file"
+      return 1
+    fi
+    printf '%s\n' "$SHALN_DUCKDB"
+    return 0
+  fi
+  if [[ -x "$SHALN_HOME/duckdb" ]]; then
+    printf '%s\n' "$SHALN_HOME/duckdb"
+    return 0
+  fi
+  local found
+  found="$(command -v duckdb 2>/dev/null || true)"
+  if [[ -n "$found" ]]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  shaln_err "could not find a duckdb binary. Set SHALN_DUCKDB, vendor one at \$SHALN_HOME/duckdb, or install duckdb (>= $SHALN_MIN_DUCKDB) on PATH"
+  return 1
+}
+
+# shaln_duckdb_version <bin> — print the dotted version (e.g. 1.5.4) on stdout.
+# DuckDB's `--version` prints e.g. "v1.5.4 (Variegata) 08e34c447b".
+shaln_duckdb_version() {
+  local bin="$1" raw
+  raw="$("$bin" --version 2>/dev/null)" || return 1
+  raw="${raw#v}"   # strip a leading 'v'
+  raw="${raw%% *}" # keep the first whitespace-delimited token
+  printf '%s\n' "$raw"
+}
+
+# shaln_version_ge <a> <b> — return 0 iff dotted version a >= b. Pure; no I/O.
+shaln_version_ge() {
+  local IFS=.
+  local -a a b
+  a=($1)
+  b=($2)
+  local i av bv
+  for ((i = 0; i < ${#b[@]}; i++)); do
+    av="${a[i]:-0}"
+    bv="${b[i]:-0}"
+    if ((10#$av > 10#$bv)); then return 0; fi
+    if ((10#$av < 10#$bv)); then return 1; fi
+  done
+  return 0
+}
+
+# shaln_require_duckdb — resolve duckdb, enforce the version gate, print its path.
+# On failure: error to stderr, return 1.
+shaln_require_duckdb() {
+  local bin ver
+  bin="$(shaln_resolve_duckdb)" || return 1
+  ver="$(shaln_duckdb_version "$bin")"
+  if [[ -z "$ver" ]]; then
+    shaln_err "could not determine the duckdb version from '$bin --version'"
+    return 1
+  fi
+  if ! shaln_version_ge "$ver" "$SHALN_MIN_DUCKDB"; then
+    shaln_err "found duckdb $ver at '$bin', but shaln requires duckdb >= $SHALN_MIN_DUCKDB"
+    return 1
+  fi
+  printf '%s\n' "$bin"
+}
+
+# shaln_run_sql <sql> — run a SQL script through the resolved duckdb. Prepends
+# `.bail on` so the first error stops the script and exits nonzero (fail loud).
+# Requires SHALN_DUCKDB_BIN + SHALN_DUCKDB_FLAGS to be set. Under --verbose the
+# duckdb output (timed per-shard banners) streams live; otherwise it is captured
+# and shown only on failure. Dies on any error.
+shaln_run_sql() {
+  local sql=".bail on
+$1"
+  if [[ -n "${SHALN_VERBOSE:-}" ]]; then
+    if ! printf '%s\n' "$sql" | "$SHALN_DUCKDB_BIN" $SHALN_DUCKDB_FLAGS -batch; then
+      shaln_die "duckdb failed (see output above)"
+    fi
+  else
+    local out
+    if ! out="$(printf '%s\n' "$sql" | "$SHALN_DUCKDB_BIN" $SHALN_DUCKDB_FLAGS -batch 2>&1)"; then
+      shaln_err "duckdb failed:"
+      printf '%s\n' "$out" >&2
+      exit 1
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Extension load preamble
+# ---------------------------------------------------------------------------
+
+# shaln_sql_quote <string> — print a single-quoted SQL string literal, doubling
+# any embedded single quotes. (Uses a quote variable so the replacement is two
+# literal quotes, not bash-escaped ones.)
+shaln_sql_quote() {
+  local q="'"
+  local s="$1"
+  s="${s//$q/$q$q}"
+  printf "%s%s%s" "$q" "$s" "$q"
+}
+
+# shaln_extension_preamble [ext_path] — print the SQL that loads the miint
+# extension. With no path (and no $SHALN_EXTENSION_PATH), install from the
+# community repository; otherwise load the given local extension by path.
+#
+# NOTE: loading a local (unsigned) extension also requires launching duckdb with
+# the -unsigned flag (see shaln_duckdb_flags) — `allow_unsigned_extensions` is a
+# startup-only setting and cannot be changed with a SET statement once the
+# database is running.
+shaln_extension_preamble() {
+  local ext="${1:-${SHALN_EXTENSION_PATH:-}}"
+  if [[ -n "$ext" ]]; then
+    printf 'LOAD %s;\n' "$(shaln_sql_quote "$ext")"
+  else
+    printf 'INSTALL miint FROM community;\nLOAD miint;\n'
+  fi
+}
+
+# shaln_duckdb_flags [ext_path] — print the extra duckdb CLI flags required by
+# the chosen extension-load strategy. A local extension path needs `-unsigned`
+# at startup; the community-install path needs nothing.
+shaln_duckdb_flags() {
+  local ext="${1:-${SHALN_EXTENSION_PATH:-}}"
+  if [[ -n "$ext" ]]; then
+    printf '%s' '-unsigned'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+shaln_usage() {
+  cat <<EOF
+shaln $SHALN_VERSION — sharded alignment over DuckDB + duckdb-miint
+
+Usage:
+  shaln <command> [options]
+
+Commands:
+  index     Build a sharded alignment bundle from references + a shard map
+  align     Align reads against a sharded bundle
+  version   Print the shaln version
+  help      Show this help
+
+Environment:
+  SHALN_DUCKDB           Path to the duckdb binary (>= $SHALN_MIN_DUCKDB)
+  SHALN_EXTENSION_PATH   Path to a local miint extension (loaded unsigned)
+
+Run 'shaln <command> --help' for command-specific options.
+EOF
+}
+
+shaln_cmd_version() {
+  printf 'shaln %s\n' "$SHALN_VERSION"
+}
+
+# shaln_validate_int <flag-name> <value> — die (usage error) unless value is a
+# positive integer (>= 1). Used for --chunk-size / --k / --w / --threads.
+shaln_validate_int() {
+  case "$2" in
+  '' | *[!0-9]*) shaln_arg_error "shaln index: $1 must be a positive integer, got '$2'" ;;
+  esac
+  if ! ((10#$2 >= 1)); then
+    shaln_arg_error "shaln index: $1 must be >= 1, got '$2'"
+  fi
+}
+
+# shaln_index_usage — usage text for `shaln index`.
+shaln_index_usage() {
+  cat <<EOF
+Usage: shaln index --references <fasta|parquet> --shard-map <tsv> -o <bundle> [options]
+
+Build a sharded alignment bundle.
+
+Required:
+  --references PATH   Reference sequences: FASTA/FASTQ, or Parquet (read_fastx schema).
+  --shard-map PATH    TSV (no header), 2 columns: <reference_id>\t<shard_name>.
+                      Only references listed here are indexed; any reference in
+                      --references that is absent from the shard-map is ignored.
+  -o, --output DIR    Output bundle directory.
+
+Options:
+  --aligner NAME      'minimap2' (default) or 'bowtie2' (requires gpl-boundary).
+  --chunk-size N      Reference chunk size for the rype routing index (default 100000).
+  --preset STR        minimap2 preset (baked into the .mmi at index time).
+  --k N               minimap2 k-mer size (index time).
+  --w N               minimap2 minimizer window (index time).
+  --eqx               minimap2: emit =/X CIGAR ops (index time).
+  --threads N         bowtie2-build threads.
+  --extension-path P  Load a local (unsigned) miint extension instead of the community build.
+  --verbose           Timestamped progress to stderr.
+  -h, --help          Show this help.
+EOF
+}
+
+# shaln_read_shard_names <shard-map> — print the distinct shard names (column 2),
+# after validating the TSV format and that every shard name is a safe path/SQL
+# component. Errors to stderr + return 1 on a malformed map or unsafe name.
+shaln_read_shard_names() {
+  local map="$1" names
+  # One pass: validate the 2-column format AND emit column 2. awk exits 1 on a
+  # malformed row, which pipefail surfaces as a failure of the substitution.
+  if ! names="$(awk -F'\t' '
+      /^[[:space:]]*$/ { next }
+      NF != 2 || $1 == "" || $2 == "" { exit 1 }
+      { print $2 }
+    ' "$map" | sort -u)"; then
+    shaln_err "shaln index: shard-map '$map' must be a 2-column TSV: <reference_id>\\t<shard_name>"
+    return 1
+  fi
+  local s
+  while IFS= read -r s; do
+    [[ -z "$s" ]] && continue
+    case "$s" in
+    . | ..) shaln_err "shaln index: invalid shard name '$s'"; return 1 ;;
+    *[!A-Za-z0-9._-]*)
+      shaln_err "shaln index: shard name '$s' has unsafe characters (allowed: A-Z a-z 0-9 . _ -)"
+      return 1
+      ;;
+    esac
+  done <<EOF
+$names
+EOF
+  printf '%s\n' "$names"
+}
+
+# shaln_minimap2_named_params <preset> <k> <w> <eqx> — emit the trailing named
+# parameters for save_minimap2_index (each only when set). Leading ", " included.
+shaln_minimap2_named_params() {
+  local preset="$1" k="$2" w="$3" eqx="$4" out=""
+  [[ -n "$preset" ]] && out="$out, preset := $(shaln_sql_quote "$preset")"
+  [[ -n "$k" ]] && out="$out, k := $k"
+  [[ -n "$w" ]] && out="$out, w := $w"
+  [[ -n "$eqx" ]] && out="$out, eqx := true"
+  printf '%s' "$out"
+}
+
+# shaln_bowtie2_named_params <threads> — trailing named params for save_bowtie2_index.
+shaln_bowtie2_named_params() {
+  [[ -n "$1" ]] && printf ', threads := %s' "$1"
+}
+
+# shaln_index_require_bowtie2 — die with an install hint unless the extension
+# reports bowtie2_available() (i.e. gpl-boundary is installed + usable).
+shaln_index_require_bowtie2() {
+  local out
+  out="$(printf '%s\nSELECT bowtie2_available();\n' "$(shaln_extension_preamble)" \
+    | "$SHALN_DUCKDB_BIN" $SHALN_DUCKDB_FLAGS -batch -noheader -list 2>/dev/null)"
+  if [[ "$out" != *true* ]]; then
+    shaln_die "shaln index: --aligner bowtie2 requires gpl-boundary (bowtie2 is unavailable). Install it from DuckDB with: SELECT install_gpl_boundary();"
+  fi
+}
+
+# shaln_index_build_sql <refs_reader> <shard_map> <output> <aligner> <chunk_size>
+#                       <preset> <k> <w> <eqx> <threads> <shards>
+# Emit the full SQL script (preamble + build) to stdout.
+shaln_index_build_sql() {
+  local refs_reader="$1" shard_map="$2" output="$3" aligner="$4" chunk_size="$5"
+  local preset="$6" mm_k="$7" mm_w="$8" eqx="$9" threads="${10}" shards="${11}"
+  local vp=""
+  [[ -n "${SHALN_VERBOSE:-}" ]] && vp=1
+
+  # All value-producing queries are wrapped in CREATE TABLE AS so their result
+  # tables never hit stdout — shaln detects failure via `.bail on` exit codes,
+  # not output. Verbose progress comes from the `.print` banners below.
+  printf '%s\n' "$(shaln_extension_preamble)"
+
+  printf "CREATE OR REPLACE TABLE __shaln_refs AS SELECT row_number() OVER (ORDER BY read_id)::BIGINT AS feature_idx, read_id, sequence1 FROM %s;\n" "$refs_reader"
+  printf "CREATE OR REPLACE TABLE __shaln_map AS SELECT * FROM read_csv(%s, delim='\\t', header=false, columns={'reference_id':'VARCHAR','shard_name':'VARCHAR'});\n" "$(shaln_sql_quote "$shard_map")"
+  # Fail loud if a shard-map reference_id is absent from the references.
+  printf "CREATE OR REPLACE TABLE __shaln_check AS SELECT CASE WHEN count(*) > 0 THEN error('shaln index: shard-map reference(s) not found in --references: ' || string_agg(DISTINCT reference_id, ', ')) ELSE 0 END AS ok FROM (SELECT m.reference_id FROM __shaln_map m LEFT JOIN __shaln_refs r ON m.reference_id = r.read_id WHERE r.read_id IS NULL) _v;\n"
+  printf "CREATE OR REPLACE TABLE __shaln_mapped AS SELECT f.feature_idx, f.read_id, f.sequence1, m.shard_name FROM __shaln_refs f JOIN __shaln_map m ON f.read_id = m.reference_id;\n"
+
+  local n i=0 s cnt
+  n="$(printf '%s\n' "$shards" | grep -c .)"
+  while IFS= read -r s; do
+    [[ -z "$s" ]] && continue
+    i=$((i + 1))
+    if [[ -n "$vp" ]]; then
+      # Per-shard reference count = shard-map rows for this shard (validation
+      # above guarantees every shard-map reference exists in --references).
+      cnt="$(awk -F'\t' -v s="$s" '$2 == s {n++} END {print n + 0}' "$shard_map")"
+      printf ".print '[shard %d/%d] %s (%s, %s reference(s))'\n" "$i" "$n" "$s" "$aligner" "$cnt"
+    fi
+    printf "CREATE OR REPLACE VIEW __shaln_subj AS SELECT read_id, sequence1 FROM __shaln_mapped WHERE shard_name = %s;\n" "$(shaln_sql_quote "$s")"
+    if [[ "$aligner" == "minimap2" ]]; then
+      printf "CREATE OR REPLACE TABLE __shaln_sink AS SELECT success FROM save_minimap2_index('__shaln_subj', %s%s);\n" \
+        "$(shaln_sql_quote "$output/$s.mmi")" "$(shaln_minimap2_named_params "$preset" "$mm_k" "$mm_w" "$eqx")"
+    else
+      printf "CREATE OR REPLACE TABLE __shaln_sink AS SELECT success FROM save_bowtie2_index('__shaln_subj', %s%s);\n" \
+        "$(shaln_sql_quote "$output/$s/index")" "$(shaln_bowtie2_named_params "$threads")"
+    fi
+  done <<EOF
+$shards
+EOF
+
+  [[ -n "$vp" ]] && printf ".print 'building rype routing index'\n"
+  printf "CREATE OR REPLACE TABLE __shaln_chunks AS WITH e AS (SELECT feature_idx, UNNEST(sequence_split(sequence1, %s)) AS c FROM __shaln_mapped) SELECT feature_idx, c.chunk_index AS chunk_index, c.chunk_data AS chunk_data FROM e;\n" "$chunk_size"
+  printf "CREATE OR REPLACE TABLE __shaln_mapping AS SELECT feature_idx, shard_name AS bucket_name FROM __shaln_mapped;\n"
+  printf "CREATE OR REPLACE TABLE __shaln_sink AS SELECT status FROM rype_index_create('__shaln_chunks', %s, mapping_table := '__shaln_mapping', k := 16, w := 8);\n" "$(shaln_sql_quote "$output/rype.ryxdi")"
+
+  [[ -n "$vp" ]] && printf ".print 'writing lengths.parquet'\n"
+  printf "COPY (SELECT read_id AS name, length(sequence1)::BIGINT AS length FROM __shaln_refs ORDER BY name) TO %s (FORMAT PARQUET);\n" "$(shaln_sql_quote "$output/lengths.parquet")"
+}
+
+# shaln_index_write_manifest <output> <aligner> <chunk_size> <shards>
+shaln_index_write_manifest() {
+  local output="$1" aligner="$2" chunk_size="$3" shards="$4"
+  local man="$output/manifest.tsv" s
+  {
+    printf 'shaln_manifest_version\t1\n'
+    printf 'aligner\t%s\n' "$aligner"
+    printf 'rype\trype.ryxdi\n'
+    printf 'lengths\tlengths.parquet\n'
+    printf 'chunk_size\t%s\n' "$chunk_size"
+    while IFS= read -r s; do
+      [[ -z "$s" ]] && continue
+      printf 'shard\t%s\n' "$s"
+    done <<EOF
+$shards
+EOF
+  } >"$man" || shaln_die "shaln index: could not write manifest '$man'"
+}
+
+shaln_cmd_index() {
+  local references="" shard_map="" output="" aligner="minimap2"
+  local chunk_size="100000" preset="" mm_k="" mm_w="" eqx="" threads="" ext_path=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --references) references="${2:-}"; shift 2 ;;
+    --shard-map) shard_map="${2:-}"; shift 2 ;;
+    -o | --output) output="${2:-}"; shift 2 ;;
+    --aligner) aligner="${2:-}"; shift 2 ;;
+    --chunk-size) chunk_size="${2:-}"; shift 2 ;;
+    --preset) preset="${2:-}"; shift 2 ;;
+    --k) mm_k="${2:-}"; shift 2 ;;
+    --w) mm_w="${2:-}"; shift 2 ;;
+    --eqx) eqx=1; shift ;;
+    --threads) threads="${2:-}"; shift 2 ;;
+    --extension-path) ext_path="${2:-}"; shift 2 ;;
+    --verbose) SHALN_VERBOSE=1; shift ;;
+    -h | --help) shaln_index_usage; return 0 ;;
+    --) shift; break ;;
+    -*) shaln_arg_error "shaln index: unknown option '$1'" ;;
+    *) shaln_arg_error "shaln index: unexpected argument '$1'" ;;
+    esac
+  done
+
+  # Required arguments.
+  [[ -n "$references" ]] || shaln_arg_error "shaln index: --references is required"
+  [[ -n "$shard_map" ]] || shaln_arg_error "shaln index: --shard-map is required"
+  [[ -n "$output" ]] || shaln_arg_error "shaln index: -o/--output (bundle directory) is required"
+
+  # Aligner must be known before we touch the filesystem or duckdb.
+  case "$aligner" in
+  minimap2 | bowtie2) ;;
+  *) shaln_arg_error "shaln index: --aligner must be 'minimap2' or 'bowtie2', got '$aligner'" ;;
+  esac
+
+  # Numeric knobs.
+  shaln_validate_int "--chunk-size" "$chunk_size"
+  [[ -n "$mm_k" ]] && shaln_validate_int "--k" "$mm_k"
+  [[ -n "$mm_w" ]] && shaln_validate_int "--w" "$mm_w"
+  [[ -n "$threads" ]] && shaln_validate_int "--threads" "$threads"
+
+  # Inputs must exist.
+  [[ -f "$references" ]] || shaln_arg_error "shaln index: references file not found: $references"
+  [[ -f "$shard_map" ]] || shaln_arg_error "shaln index: shard-map file not found: $shard_map"
+
+  [[ -n "$ext_path" ]] && SHALN_EXTENSION_PATH="$ext_path"
+
+  SHALN_DUCKDB_BIN="$(shaln_require_duckdb)" || exit 1
+  SHALN_DUCKDB_FLAGS="$(shaln_duckdb_flags)"
+
+  [[ "$aligner" == "bowtie2" ]] && shaln_index_require_bowtie2
+
+  local shards
+  shards="$(shaln_read_shard_names "$shard_map")" || exit 1
+  [[ -n "$shards" ]] || shaln_die "shaln index: shard-map '$shard_map' lists no shards"
+  local n_shards
+  n_shards="$(printf '%s\n' "$shards" | grep -c .)"
+
+  shaln_log "indexing into bundle '$output' (aligner=$aligner, $n_shards shard(s))"
+  mkdir -p "$output" || shaln_die "shaln index: could not create bundle directory '$output'"
+
+  local refs_reader
+  case "$references" in
+  *.parquet | *.pq) refs_reader="read_parquet($(shaln_sql_quote "$references"))" ;;
+  *) refs_reader="read_fastx($(shaln_sql_quote "$references"))" ;;
+  esac
+
+  shaln_log "building per-shard indexes + rype routing index"
+  shaln_run_sql "$(shaln_index_build_sql "$refs_reader" "$shard_map" "$output" "$aligner" "$chunk_size" "$preset" "$mm_k" "$mm_w" "$eqx" "$threads" "$shards")"
+
+  shaln_index_write_manifest "$output" "$aligner" "$chunk_size" "$shards"
+  shaln_log "done: bundle ready at '$output'"
+}
+
+# ---------------------------------------------------------------------------
+# Reads input layer (shared by `shaln align`)
+# ---------------------------------------------------------------------------
+
+# shaln_normalize_path <path> — map '-' to /dev/stdin; leave everything else.
+shaln_normalize_path() {
+  if [[ "$1" == "-" ]]; then printf '/dev/stdin'; else printf '%s' "$1"; fi
+}
+
+# shaln_parse_reads_input <args...> — pick exactly one reads input mode from the
+# input flags and set globals READS_MODE / READS_P1 / READS_P2. Any argument
+# that is not an input flag (or its value) is collected into the SHALN_REST array
+# for the caller (`shaln align`) to continue parsing. Errors to stderr + return 2.
+#
+# Modes: single (--fasta/--fastq, read_fastx auto-detects), paired (-1/-2),
+# interleaved (--interleaved), parquet (--parquet), arrow (--arrow, Arrow IPC).
+# A path of '-' means stdin.
+shaln_parse_reads_input() {
+  READS_MODE=""
+  READS_P1=""
+  READS_P2=""
+  SHALN_REST=()
+  local fastx="" parquet="" arrow="" il="" r1="" r2=""
+  local have_fastx="" have_parquet="" have_arrow="" have_il="" have_paired=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --fasta | --fastq)
+      [[ $# -ge 2 ]] || { shaln_err "shaln align: '$1' requires a path"; return 2; }
+      fastx="$2"; have_fastx=1; shift 2 ;;
+    --parquet)
+      [[ $# -ge 2 ]] || { shaln_err "shaln align: '$1' requires a path"; return 2; }
+      parquet="$2"; have_parquet=1; shift 2 ;;
+    --arrow)
+      [[ $# -ge 2 ]] || { shaln_err "shaln align: '$1' requires a path ('-' for stdin)"; return 2; }
+      arrow="$2"; have_arrow=1; shift 2 ;;
+    --interleaved)
+      [[ $# -ge 2 ]] || { shaln_err "shaln align: '$1' requires a path"; return 2; }
+      il="$2"; have_il=1; shift 2 ;;
+    -1)
+      [[ $# -ge 2 ]] || { shaln_err "shaln align: '-1' requires a path"; return 2; }
+      r1="$2"; have_paired=1; shift 2 ;;
+    -2)
+      [[ $# -ge 2 ]] || { shaln_err "shaln align: '-2' requires a path"; return 2; }
+      r2="$2"; have_paired=1; shift 2 ;;
+    *)
+      SHALN_REST+=("$1"); shift ;;
+    esac
+  done
+
+  local n=0
+  [[ -n "$have_fastx" ]] && n=$((n + 1))
+  [[ -n "$have_parquet" ]] && n=$((n + 1))
+  [[ -n "$have_arrow" ]] && n=$((n + 1))
+  [[ -n "$have_il" ]] && n=$((n + 1))
+  [[ -n "$have_paired" ]] && n=$((n + 1))
+  if [[ "$n" -eq 0 ]]; then
+    shaln_err "shaln align: no reads input (use --fasta/--fastq/--parquet/--arrow/--interleaved or -1/-2)"
+    return 2
+  fi
+  if [[ "$n" -gt 1 ]]; then
+    shaln_err "shaln align: choose exactly one reads input mode"
+    return 2
+  fi
+
+  if [[ -n "$have_paired" ]]; then
+    [[ -n "$r1" && -n "$r2" ]] || { shaln_err "shaln align: paired input requires both -1 and -2"; return 2; }
+    READS_MODE="paired"
+    READS_P1="$(shaln_normalize_path "$r1")"
+    READS_P2="$(shaln_normalize_path "$r2")"
+  elif [[ -n "$have_fastx" ]]; then
+    READS_MODE="single"
+    READS_P1="$(shaln_normalize_path "$fastx")"
+  elif [[ -n "$have_parquet" ]]; then
+    READS_MODE="parquet"
+    READS_P1="$(shaln_normalize_path "$parquet")"
+  elif [[ -n "$have_arrow" ]]; then
+    READS_MODE="arrow"
+    READS_P1="$(shaln_normalize_path "$arrow")"
+  else
+    READS_MODE="interleaved"
+    READS_P1="$(shaln_normalize_path "$il")"
+  fi
+  return 0
+}
+
+# shaln_reads_relation <mode> <p1> [p2] — emit a parenthesized SQL relation that
+# yields the normalized read schema (read_id, sequence1, sequence2, qual1, qual2)
+# for the given mode. Single-scan throughout, so it is safe over a non-seekable
+# stdin (a self-join would re-read stdin). Arrow requires the arrow extension to
+# be loaded by the caller before this relation is queried.
+shaln_reads_relation() {
+  local mode="$1" p1="$2" p2="${3:-}"
+  case "$mode" in
+  single)
+    printf '(SELECT read_id, sequence1, sequence2, qual1, qual2 FROM read_fastx(%s))' \
+      "$(shaln_sql_quote "$p1")" ;;
+  paired)
+    printf '(SELECT read_id, sequence1, sequence2, qual1, qual2 FROM read_fastx(%s, sequence2 := %s))' \
+      "$(shaln_sql_quote "$p1")" "$(shaln_sql_quote "$p2")" ;;
+  interleaved)
+    # De-interleave in one pass: consecutive records (odd=R1, even=R2) collapse
+    # into one row, grouped by pair ordinal ((sequence_index + 1) // 2).
+    printf '(SELECT any_value(CASE WHEN sequence_index %% 2 = 1 THEN read_id END) AS read_id, any_value(CASE WHEN sequence_index %% 2 = 1 THEN sequence1 END) AS sequence1, any_value(CASE WHEN sequence_index %% 2 = 0 THEN sequence1 END) AS sequence2, any_value(CASE WHEN sequence_index %% 2 = 1 THEN qual1 END) AS qual1, any_value(CASE WHEN sequence_index %% 2 = 0 THEN qual1 END) AS qual2 FROM read_fastx(%s) GROUP BY (sequence_index + 1) // 2)' \
+      "$(shaln_sql_quote "$p1")" ;;
+  parquet)
+    printf '(SELECT read_id, sequence1, sequence2, qual1, qual2 FROM read_parquet(%s))' \
+      "$(shaln_sql_quote "$p1")" ;;
+  arrow)
+    printf '(SELECT read_id, sequence1, sequence2, qual1, qual2 FROM read_arrow(%s))' \
+      "$(shaln_sql_quote "$p1")" ;;
+  *)
+    shaln_err "internal: unknown reads mode '$mode'"
+    return 1 ;;
+  esac
+}
+
+# shaln_run_sql_stream <sql> — run a SQL script through duckdb, letting stdout
+# (the output stream, e.g. SAM/BAM/Arrow to /dev/stdout) and stderr (progress +
+# errors) flow through to shaln's own streams. Prepends `.bail on`; dies on error.
+shaln_run_sql_stream() {
+  local sql=".bail on
+$1"
+  if ! printf '%s\n' "$sql" | "$SHALN_DUCKDB_BIN" $SHALN_DUCKDB_FLAGS -batch; then
+    shaln_die "shaln align: duckdb failed during alignment"
+  fi
+}
+
+# shaln_validate_uint <flag> <value> — die (usage) unless value is a non-negative
+# integer (allows 0, e.g. --max-secondary 0).
+shaln_validate_uint() {
+  case "$2" in
+  '' | *[!0-9]*) shaln_arg_error "shaln align: $1 must be a non-negative integer, got '$2'" ;;
+  esac
+}
+
+# shaln_validate_num <flag> <value> — die (usage) unless value is a simple
+# decimal (rejects empty, non-numeric, multi-dot like '1.2.3', and a lone '.').
+shaln_validate_num() {
+  case "$2" in
+  '' | . | *[!0-9.]* | *.*.*) shaln_arg_error "shaln align: $1 must be a number, got '$2'" ;;
+  esac
+}
+
+# shaln_manifest_get <bundle> <key> — first value for <key> in manifest.tsv.
+shaln_manifest_get() {
+  awk -F'\t' -v k="$2" '$1 == k {print $2; exit}' "$1/manifest.tsv"
+}
+
+# shaln_manifest_shards <bundle> — the shard names recorded in the manifest.
+shaln_manifest_shards() {
+  awk -F'\t' '$1 == "shard" {print $2}' "$1/manifest.tsv"
+}
+
+# shaln_align_named_params <aligner> <preset> <max_secondary> <max_tps> <eqx>
+#                          <min_chain_coverage> <local>
+# Emit trailing named params for the sharded align function (each only when set,
+# and only when valid for the aligner). Leading ", " included.
+shaln_align_named_params() {
+  local aligner="$1" preset="$2" maxsec="$3" maxtps="$4" eqx="$5" minchain="$6" loc="$7" out=""
+  [[ -n "$preset" ]] && out="$out, preset := $(shaln_sql_quote "$preset")"
+  [[ -n "$maxsec" ]] && out="$out, max_secondary := $maxsec"
+  [[ -n "$maxtps" ]] && out="$out, max_threads_per_shard := $maxtps"
+  if [[ "$aligner" == "minimap2" ]]; then
+    [[ -n "$eqx" ]] && out="$out, eqx := true"
+    [[ -n "$minchain" ]] && out="$out, min_chain_coverage := $minchain"
+  else
+    [[ -n "$loc" ]] && out="$out, local := true"
+  fi
+  printf '%s' "$out"
+}
+
+shaln_align_usage() {
+  cat <<EOF
+Usage: shaln align --bundle <dir> <reads-input> [options]
+
+Align reads against a bundle built by 'shaln index'. The aligner (minimap2 or
+bowtie2) is read from the bundle's manifest.
+
+Reads input (choose one; '-' means stdin):
+  --fasta PATH | --fastq PATH   Single-end FASTA/FASTQ (read_fastx auto-detects).
+  -1 PATH -2 PATH               Paired-end (two files).
+  --interleaved PATH            Interleaved paired-end (R1,R2,R1,R2,...).
+  --parquet PATH                Parquet (read_fastx schema).
+  --arrow PATH                  Arrow IPC stream ('--arrow -' for stdin).
+
+Required:
+  --bundle DIR                  Bundle directory from 'shaln index'.
+
+Output:
+  -o, --output PATH             Output file ('-' or omit = stdout). Parquet needs a file.
+  --format sam|bam|parquet|arrow  Default: inferred from -o extension, else 'sam'.
+  --include-seq-qual            Write SEQ/QUAL into SAM/BAM (default: '*').
+
+Routing:
+  (default)                     rype routing index in the bundle.
+  --broadcast                   Align every read against every shard.
+  --route-threshold FLOAT       rype classification threshold.
+
+Alignment passthrough:
+  --preset STR, --max-secondary N, --max-threads-per-shard N (both aligners)
+  --eqx, --min-chain-coverage FLOAT (minimap2)   --local (bowtie2)
+  --threads N                   DuckDB thread count (SET threads).
+
+  --extension-path PATH         Load a local (unsigned) miint extension.
+  --verbose                     Timestamped milestones + live per-shard progress (stderr).
+  -h, --help                    Show this help.
+
+Note: minimap2 k/w are baked into the .mmi at index time and are not settable here.
+Only mapped alignment records are written (per-shard non-matches are dropped). With
+rype routing, a read that matches no shard above the threshold is not aligned and
+produces no record; --broadcast aligns every read against every shard. --verbose
+reports reads-loaded vs classified so this pre-filtering is visible.
+EOF
+}
+
+shaln_cmd_align() {
+  # --help short-circuits before any input/bundle validation.
+  local a
+  for a in "$@"; do
+    case "$a" in -h | --help)
+      shaln_align_usage
+      return 0
+      ;;
+    esac
+  done
+
+  # Stage 1: pull the reads input mode out; everything else lands in SHALN_REST.
+  shaln_parse_reads_input "$@" || return $?
+
+  # Stage 2: parse the remaining (non-input) flags.
+  local bundle="" output="" format="" incl_sq="" broadcast="" threshold="" threads="" ext_path=""
+  local ap_preset="" ap_maxsec="" ap_maxtps="" ap_eqx="" ap_minchain="" ap_local=""
+  if [[ ${#SHALN_REST[@]} -gt 0 ]]; then set -- "${SHALN_REST[@]}"; else set --; fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --bundle) bundle="${2:-}"; shift 2 ;;
+    -o | --output) output="${2:-}"; shift 2 ;;
+    --format) format="${2:-}"; shift 2 ;;
+    --include-seq-qual) incl_sq=1; shift ;;
+    --broadcast) broadcast=1; shift ;;
+    --route-threshold) threshold="${2:-}"; shift 2 ;;
+    --threads) threads="${2:-}"; shift 2 ;;
+    --preset) ap_preset="${2:-}"; shift 2 ;;
+    --max-secondary) ap_maxsec="${2:-}"; shift 2 ;;
+    --max-threads-per-shard) ap_maxtps="${2:-}"; shift 2 ;;
+    --eqx) ap_eqx=1; shift ;;
+    --min-chain-coverage) ap_minchain="${2:-}"; shift 2 ;;
+    --local) ap_local=1; shift ;;
+    --extension-path) ext_path="${2:-}"; shift 2 ;;
+    --verbose) SHALN_VERBOSE=1; shift ;;
+    -*) shaln_arg_error "shaln align: unknown option '$1'" ;;
+    *) shaln_arg_error "shaln align: unexpected argument '$1'" ;;
+    esac
+  done
+
+  # Required bundle + its manifest.
+  [[ -n "$bundle" ]] || shaln_arg_error "shaln align: --bundle is required"
+  [[ -d "$bundle" ]] || shaln_arg_error "shaln align: bundle directory not found: $bundle"
+  [[ -f "$bundle/manifest.tsv" ]] || shaln_arg_error "shaln align: '$bundle' is not a shaln bundle (no manifest.tsv)"
+
+  # Reads input file must exist (unless it is stdin).
+  if [[ "$READS_P1" != "/dev/stdin" && ! -f "$READS_P1" ]]; then
+    shaln_arg_error "shaln align: reads file not found: $READS_P1"
+  fi
+  if [[ "$READS_MODE" == "paired" && "$READS_P2" != "/dev/stdin" && ! -f "$READS_P2" ]]; then
+    shaln_arg_error "shaln align: mate file not found: $READS_P2"
+  fi
+
+  # Numeric validation (these are interpolated into SQL).
+  [[ -n "$ap_maxsec" ]] && shaln_validate_uint "--max-secondary" "$ap_maxsec"
+  [[ -n "$ap_maxtps" ]] && shaln_validate_uint "--max-threads-per-shard" "$ap_maxtps"
+  [[ -n "$threads" ]] && shaln_validate_uint "--threads" "$threads"
+  [[ -n "$ap_minchain" ]] && shaln_validate_num "--min-chain-coverage" "$ap_minchain"
+  [[ -n "$threshold" ]] && shaln_validate_num "--route-threshold" "$threshold"
+
+  # Aligner comes from the manifest (the bundle was built for exactly one).
+  local aligner
+  aligner="$(shaln_manifest_get "$bundle" aligner)"
+  case "$aligner" in
+  minimap2 | bowtie2) ;;
+  *) shaln_die "shaln align: bundle manifest has an unknown aligner '$aligner'" ;;
+  esac
+  # Reject aligner-incompatible passthrough flags (fail loud).
+  if [[ "$aligner" == "minimap2" && -n "$ap_local" ]]; then
+    shaln_arg_error "shaln align: --local applies to bowtie2 bundles, not minimap2"
+  fi
+  if [[ "$aligner" == "bowtie2" ]]; then
+    [[ -n "$ap_eqx" ]] && shaln_arg_error "shaln align: --eqx applies to minimap2 bundles"
+    [[ -n "$ap_minchain" ]] && shaln_arg_error "shaln align: --min-chain-coverage applies to minimap2 bundles"
+  fi
+
+  # rype/lengths filenames from the manifest. Check non-empty here (not inside a
+  # command substitution, where shaln_die's exit would only kill the subshell) so
+  # a hand-corrupted manifest fails loud instead of resolving to '$bundle/'.
+  local rype_name lengths_name rype_rel lengths_rel
+  rype_name="$(shaln_manifest_get "$bundle" rype)"
+  lengths_name="$(shaln_manifest_get "$bundle" lengths)"
+  [[ -n "$rype_name" ]] || shaln_die "shaln align: bundle manifest '$bundle/manifest.tsv' is missing the 'rype' key"
+  [[ -n "$lengths_name" ]] || shaln_die "shaln align: bundle manifest '$bundle/manifest.tsv' is missing the 'lengths' key"
+  rype_rel="$bundle/$rype_name"
+  lengths_rel="$bundle/$lengths_name"
+
+  # Output format + destination.
+  local dest="/dev/stdout"
+  [[ -n "$output" && "$output" != "-" ]] && dest="$output"
+  if [[ -z "$format" ]]; then
+    case "$output" in
+    *.sam) format=sam ;;
+    *.bam) format=bam ;;
+    *.parquet | *.pq) format=parquet ;;
+    *.arrow) format=arrow ;;
+    *) format=sam ;;
+    esac
+  fi
+  case "$format" in
+  sam | bam | parquet | arrow) ;;
+  *) shaln_arg_error "shaln align: --format must be sam, bam, parquet, or arrow (got '$format')" ;;
+  esac
+  if [[ "$format" == "parquet" && "$dest" == "/dev/stdout" ]]; then
+    shaln_arg_error "shaln align: parquet output requires -o <file>"
+  fi
+
+  [[ -n "$ext_path" ]] && SHALN_EXTENSION_PATH="$ext_path"
+  SHALN_DUCKDB_BIN="$(shaln_require_duckdb)" || exit 1
+  SHALN_DUCKDB_FLAGS="$(shaln_duckdb_flags)"
+  [[ "$aligner" == "bowtie2" ]] && shaln_index_require_bowtie2
+
+  # Need the arrow extension for Arrow input or Arrow output.
+  local needs_arrow=""
+  [[ "$READS_MODE" == "arrow" || "$format" == "arrow" ]] && needs_arrow=1
+
+  local routing="rype"
+  [[ -n "$broadcast" ]] && routing="broadcast"
+
+  shaln_log "aligning against bundle '$bundle' (aligner=$aligner, routing=$routing, output=$format -> $dest)"
+
+  # --- assemble the SQL -----------------------------------------------------
+  local reads_rel sql
+  reads_rel="$(shaln_reads_relation "$READS_MODE" "$READS_P1" "$READS_P2")" || exit 1
+
+  sql="$(shaln_extension_preamble)"$'\n'
+  [[ -n "$needs_arrow" ]] && sql="${sql}INSTALL arrow FROM community;"$'\n'"LOAD arrow;"$'\n'
+  [[ -n "$threads" ]] && sql="${sql}SET threads = ${threads};"$'\n'
+  sql="${sql}CREATE OR REPLACE TABLE __shaln_reads AS ${reads_rel};"$'\n'
+
+  if [[ "$routing" == "broadcast" ]]; then
+    local shard_values="" s
+    while IFS= read -r s; do
+      [[ -z "$s" ]] && continue
+      [[ -n "$shard_values" ]] && shard_values="$shard_values, "
+      shard_values="$shard_values($(shaln_sql_quote "$s"))"
+    done <<EOF
+$(shaln_manifest_shards "$bundle")
+EOF
+    [[ -n "$shard_values" ]] || shaln_die "shaln align: bundle manifest lists no shards"
+    sql="${sql}CREATE OR REPLACE TABLE __shaln_r2s AS SELECT r.read_id, s.shard_name FROM __shaln_reads r CROSS JOIN (VALUES ${shard_values}) s(shard_name);"$'\n'
+  else
+    [[ -d "$rype_rel" ]] || shaln_die "shaln align: bundle is missing its rype index '$rype_rel' (use --broadcast to skip routing)"
+    local thr_param=""
+    [[ -n "$threshold" ]] && thr_param=", threshold := ${threshold}"
+    sql="${sql}CREATE OR REPLACE TABLE __shaln_r2s AS SELECT DISTINCT read_id, bucket_name AS shard_name FROM rype_classify($(shaln_sql_quote "$rype_rel"), '__shaln_reads', id_column := 'read_id'${thr_param});"$'\n'
+  fi
+
+  local fn="align_minimap2_sharded"
+  [[ "$aligner" == "bowtie2" ]] && fn="align_bowtie2_sharded"
+  local params prog=""
+  params="$(shaln_align_named_params "$aligner" "$ap_preset" "$ap_maxsec" "$ap_maxtps" "$ap_eqx" "$ap_minchain" "$ap_local")"
+  [[ -n "${SHALN_VERBOSE:-}" ]] && prog=", progress := true"
+  sql="${sql}CREATE OR REPLACE TABLE __shaln_aln AS SELECT * FROM ${fn}('__shaln_reads', shard_directory := $(shaln_sql_quote "$bundle"), read_to_shard := '__shaln_r2s'${params}${prog});"$'\n'
+
+  # Verbose stats: written to a temp file, surfaced as Layer-1 milestones below.
+  local stats=""
+  if [[ -n "${SHALN_VERBOSE:-}" ]]; then
+    stats="$(mktemp "${TMPDIR:-/tmp}/shaln-stats.XXXXXX")"
+    sql="${sql}COPY (SELECT 'summary' AS a, 'reads' AS b, (SELECT count(*) FROM __shaln_reads)::VARCHAR AS c UNION ALL SELECT 'summary', 'classified', (SELECT count(*) FROM __shaln_r2s)::VARCHAR UNION ALL SELECT 'summary', 'alignments', (SELECT count(*) FROM __shaln_aln WHERE NOT alignment_is_unmapped(flags))::VARCHAR UNION ALL SELECT 'shard', shard_name, count(*)::VARCHAR FROM __shaln_r2s GROUP BY shard_name) TO $(shaln_sql_quote "$stats") (FORMAT csv, HEADER false);"$'\n'
+  fi
+
+  local destq
+  destq="$(shaln_sql_quote "$dest")"
+  case "$format" in
+  sam | bam)
+    local fmtkw="SAM"
+    [[ "$format" == "bam" ]] && fmtkw="BAM"
+    local seqdata=""
+    [[ -n "$incl_sq" ]] && seqdata=", SEQUENCE_DATA '__shaln_reads'"
+    sql="${sql}CREATE OR REPLACE VIEW __shaln_lengths AS SELECT * FROM read_parquet($(shaln_sql_quote "$lengths_rel"));"$'\n'
+    sql="${sql}COPY (SELECT * FROM __shaln_aln WHERE NOT alignment_is_unmapped(flags)) TO ${destq} (FORMAT ${fmtkw}, REFERENCE_LENGTHS '__shaln_lengths'${seqdata});"$'\n'
+    ;;
+  parquet)
+    sql="${sql}COPY (SELECT * FROM __shaln_aln WHERE NOT alignment_is_unmapped(flags)) TO ${destq} (FORMAT PARQUET);"$'\n'
+    ;;
+  arrow)
+    sql="${sql}COPY (SELECT * FROM __shaln_aln WHERE NOT alignment_is_unmapped(flags)) TO ${destq} (FORMAT arrow);"$'\n'
+    ;;
+  esac
+
+  shaln_run_sql_stream "$sql"
+
+  # Layer-1 verbose counts, read back from the stats file.
+  if [[ -n "${SHALN_VERBOSE:-}" && -f "$stats" ]]; then
+    local tag key val
+    while IFS=, read -r tag key val; do
+      case "$tag" in
+      summary) shaln_log "$key: $val" ;;
+      shard) shaln_log "  routed to shard '$key': $val read(s)" ;;
+      esac
+    done <"$stats"
+  fi
+  shaln_log "wrote $format alignments to '$dest'"
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+shaln_main() {
+  set -euo pipefail
+  local cmd="${1:-}"
+  [[ $# -gt 0 ]] && shift || true
+  case "$cmd" in
+  index) shaln_cmd_index "$@" ;;
+  align) shaln_cmd_align "$@" ;;
+  version | --version | -V) shaln_cmd_version ;;
+  help | --help | -h) shaln_usage ;;
+  "")
+    shaln_usage >&2
+    exit 2
+    ;;
+  *)
+    shaln_err "unknown subcommand '$cmd'"
+    shaln_usage >&2
+    exit 2
+    ;;
+  esac
+}
+
+# Only run when executed directly; sourcing (e.g. from tests) just defines functions.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  shaln_main "$@"
+fi

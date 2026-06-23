@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Test fixture: a fake `duckdb` that reports an unsupported (too old) version.
+# Used by tests/run.sh to verify shaln's >= 1.5.4 version gate fails loud.
+# Ignores all arguments.
+echo "v1.2.0 (HistoricRelease) deadbeef99"
