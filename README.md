@@ -38,38 +38,26 @@ Overrides:
 ## Quickstart — a real, end-to-end example
 
 Build a 2-shard bundle from two small public genomes, then align a public sequencing run
-against it. `$DUCKDB` is your DuckDB binary (`./duckdb` after `install.sh`, or any `duckdb ≥ 1.5.4`).
+against it. The first step downloads the example data for you, so there's nothing to write by hand:
 
 ```bash
-DUCKDB=./duckdb     # or: DUCKDB=duckdb
+# 1. Fetch the example data. Writes three files into the current directory:
+#    refs.fasta (phiX174 + lambda), shard-map.tsv (2 shards), reads.parquet (~2000 reads).
+./examples/fetch-data.sh
 
-# 1. Fetch references (phiX174 + lambda) and write a FASTA.
-"$DUCKDB" -c "INSTALL miint FROM community; LOAD miint;
-  COPY (SELECT read_id, sequence1 FROM read_ncbi_fasta(['NC_001422.1','NC_001416.1']))
-  TO 'refs.fasta' (FORMAT fasta);"
-
-# 2. Derive a shard map (reference_id <TAB> shard_name) straight from the FASTA's ids,
-#    round-robin into two shards. Edit this to group references however you like.
-"$DUCKDB" -c "INSTALL miint FROM community; LOAD miint;
-  COPY (
-    SELECT read_id AS reference_id,
-           'shard_' || ((row_number() OVER (ORDER BY read_id) - 1) % 2)::VARCHAR AS shard_name
-    FROM read_fastx('refs.fasta')
-  ) TO 'shard-map.tsv' (FORMAT csv, DELIMITER '\t', HEADER false);"
-
-# 3. Build the bundle (per-shard .mmi indexes + rype routing index + lengths + manifest).
+# 2. Build the bundle (per-shard .mmi indexes + rype routing index + lengths + manifest).
 ./shaln index --references refs.fasta --shard-map shard-map.tsv -o bundle --verbose
 
-# 4. Fetch a public sequencing run and align it against the bundle.
-"$DUCKDB" -c "INSTALL miint FROM community; LOAD miint;
-  COPY (SELECT * FROM read_ena_sequences('ERR1074767', max_sequences := 2000))
-  TO 'reads.parquet' (FORMAT PARQUET);"
-
-# 5. Align -> BAM and Parquet. (--recover-names writes original read names as QNAMEs;
+# 3. Align -> BAM and Parquet. (--recover-names writes original read names as QNAMEs;
 #    omit it to stream with the integer sequence_index instead — see "Read names" below.)
 ./shaln align --bundle bundle --parquet reads.parquet --recover-names -o aln.bam --verbose
 ./shaln align --bundle bundle --parquet reads.parquet --recover-names --format parquet -o aln.parquet
 ```
+
+`examples/fetch-data.sh` is the only step that touches the network (it downloads the genomes and
+reads). It uses the same DuckDB that `shaln` does — the one `install.sh` vendored, or your own via
+`SHALN_DUCKDB`. The shard map it writes is just `reference_id <TAB> shard_name`; edit `shard-map.tsv`
+to group references into shards however you like (see [`shaln index`](#shaln-index) below).
 
 phiX174 is the standard Illumina spike-in, so a typical Illumina run aligns its spike-in reads to
 the phiX shard. Reads that match no shard above the routing threshold are simply not aligned — pass
@@ -169,17 +157,11 @@ alignment back to the full read→name map, which is read-scale and spills to di
 
 Two ways to get names:
 
-- **`--recover-names`** — shaln does the join for you and writes original names inline. Convenient for
-  smaller runs; pay the read-scale join.
-- **Map back afterwards** (recommended at scale) — keep the reads with `--reads-cache reads.parquet`
-  (it has `sequence_index` + `read_id`), then join your alignments on `sequence_index`. For example,
-  with Parquet output:
-
-  ```sql
-  SELECT r.read_id AS qname, a.* EXCLUDE (read_id)
-  FROM read_parquet('aln.parquet') a
-  JOIN read_parquet('reads.parquet') r ON a.read_id = r.sequence_index;
-  ```
+- **`--recover-names`** — shaln does the join for you and writes the original names inline. Convenient
+  for smaller runs; you pay a read-scale join.
+- **Map back afterwards** (recommended at scale) — keep the reads with `--reads-cache reads.parquet`.
+  That file carries both `sequence_index` and `read_id` (the original name), so you can match each
+  alignment back to its name on `sequence_index` in whatever tool you use for downstream analysis.
 
 ## Requirements
 
