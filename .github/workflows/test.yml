@@ -1,24 +1,62 @@
-name: test
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  # Dependency-free tests (parsing, version gate, option table, output/format
+  # inference, the bowtie2-install state machine via stub duckdbs, the installer
+  # platform mapping). The integration tests that need a real DuckDB + the miint
+  # extension skip here (require-env style) — see the note at the bottom.
+  #
+  # macOS is in the matrix on purpose: its runners ship bash 3.2, the version
+  # shaln deliberately targets, so this guards the 3.2 compatibility the whole
+  # codebase relies on (indexed arrays, ${#arr[@]} guards, no associative arrays).
+  unit:
+    name: unit (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Syntax check
+      - name: bash version
+        run: bash --version | head -1
+      - name: syntax check
         run: |
           bash -n shaln
           bash -n install.sh
           bash -n tests/run.sh
-
-      - name: Run test suite
-        # SHALN_DUCKDB / SHALN_EXTENSION_PATH are unset, so the integration
-        # tests skip and the dependency-free unit tests run (parsing, version
-        # gate, reads-input/normalization logic, installer platform mapping).
+      - name: tests
         run: bash tests/run.sh
+
+  # Static analysis of the shell scripts. shellcheck is preinstalled on the ubuntu
+  # runner. Warnings are a hard failure — intentional patterns carry inline
+  # `# shellcheck disable=` directives — so this is a real gate.
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning shaln install.sh tests/run.sh
+
+# Note on integration tests: the `shaln index` / `shaln align` end-to-end tests
+# require a DuckDB + miint build that includes the functions shaln drives
+# (e.g. sequence_split, native interleaved read_fastx, the minimap2 map-time
+# knobs). The community `miint` extension currently lags these, so they cannot be
+# run in CI against it yet — they run locally against a dev build by exporting
+# SHALN_DUCKDB + SHALN_EXTENSION_PATH before `bash tests/run.sh`. Once those
+# functions are published to the community extension, an integration job can
+# install it (`INSTALL miint FROM community`) and run the full suite here.

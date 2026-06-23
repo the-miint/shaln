@@ -305,6 +305,58 @@ test_require_duckdb_accepts_good_version() {
   assert_eq "$FIX/duckdb-stub-good" "$CAP_OUT" "require returns the duckdb path"
 }
 
+# --- shaln bowtie2 require + gpl-boundary auto-install (stubbed) ------------
+# These exercise shaln_require_bowtie2 with fake duckdb binaries so the
+# auto-install / fresh-process re-check behavior is hermetically testable. The
+# function reads $SHALN_DUCKDB_BIN / $SHALN_DUCKDB_FLAGS directly (it runs after
+# shaln_require_duckdb has set them), so the tests set those rather than going
+# through discovery.
+
+# stub_require_bowtie2 <stub> [state-file] — run shaln_require_bowtie2 in a
+# subshell wired to the given duckdb stub (the function calls exit on failure,
+# so it must not run in the test process). Sets CAP_OUT (stdout+stderr) / CAP_RC.
+stub_require_bowtie2() {
+  CAP_OUT="$(SHALN_DUCKDB_BIN="$FIX/$1" SHALN_DUCKDB_FLAGS="" SHALN_STUB_STATE="${2:-}" \
+    bash -c 'source "$1"; shaln_require_bowtie2 index' _ "$SHALN" 2>&1)"
+  CAP_RC=$?
+}
+
+test_require_bowtie2_available_proceeds() {
+  stub_require_bowtie2 duckdb-stub-bowtie2-ok
+  assert_rc 0 "$CAP_RC" "an available bowtie2 proceeds"
+  # No install should be attempted when bowtie2 is already there.
+  assert_not_contains "$CAP_OUT" "attempting" "no install attempt when already available"
+  assert_not_contains "$CAP_OUT" "Installed gpl-boundary" "install not run when available"
+}
+
+test_require_bowtie2_auto_installs_then_succeeds() {
+  # bowtie2 starts unavailable; the auto-install flips a fresh-process re-check
+  # to available. The state file must NOT exist initially (so the first check is
+  # false), and is created by the stub's install branch.
+  local state
+  state="$(new_bundle_dir)/installed" # dir exists, file does not
+  stub_require_bowtie2 duckdb-stub-bowtie2-install-ok "$state"
+  assert_rc 0 "$CAP_RC" "auto-install makes bowtie2 available ($CAP_OUT)"
+  assert_contains "$CAP_OUT" "gpl-boundary" "reports the gpl-boundary install attempt"
+  # The recovery only works if the re-check is a SEPARATE invocation: the stub
+  # reports false until the install ran in a prior process. Proof of success is
+  # rc 0 with the install having been triggered.
+  [[ -f "$state" ]] || _diag "install branch did not run (state file absent)"
+}
+
+test_require_bowtie2_persistent_failure_is_friendly() {
+  stub_require_bowtie2 duckdb-stub-bowtie2-install-fail
+  assert_rc 1 "$CAP_RC" "persistent unavailability exits 1"
+  # The message must be understandable without DuckDB knowledge: name what
+  # gpl-boundary is, that an install was attempted, the real prerequisites, and
+  # an escape hatch — and NOT lean on a bare SQL incantation.
+  assert_contains "$CAP_OUT" "gpl-boundary" "names gpl-boundary"
+  assert_contains "$CAP_OUT" "curl" "names the curl prerequisite"
+  assert_contains "$CAP_OUT" "network" "names the network prerequisite"
+  assert_contains "$CAP_OUT" "minimap2" "offers the no-install minimap2 fallback"
+  assert_not_contains "$CAP_OUT" "SELECT" "no raw SQL-only guidance"
+}
+
 # --- shaln index: argument validation (no duckdb needed) -------------------
 
 test_index_requires_references() {
@@ -542,12 +594,13 @@ test_reads_arrow_stdin() {
 
 test_reads_schema_columns() {
   require_duckdb_ext || return
-  # The normalized relation must expose exactly the read_fastx-schema columns.
+  # The normalized relation must expose the BIGINT routing key sequence_index
+  # plus the read_fastx-schema columns, in that order.
   CAP_OUT="$(printf ".bail on\nLOAD '%s';\nSELECT string_agg(column_name, ',') FROM (DESCRIBE SELECT * FROM %s);\n" \
     "$INT_EXT" "$(shaln_reads_relation single "$FIX/reads_se.fq")" \
     | "$INT_DUCKDB" -unsigned -noheader -list 2>&1)"
   assert_rc 0 "$CAP_RC" "describe succeeds ($CAP_OUT)"
-  assert_eq "read_id,sequence1,sequence2,qual1,qual2" "$CAP_OUT" "normalized schema is exactly the 5 columns"
+  assert_eq "sequence_index,read_id,sequence1,sequence2,qual1,qual2" "$CAP_OUT" "normalized schema is sequence_index + the 5 read columns"
 }
 
 # --- shaln align: argument validation (no duckdb needed) -------------------
@@ -564,6 +617,81 @@ test_align_requires_input() {
   assert_contains "$CAP_OUT" "input" "error mentions reads input"
 }
 
+# --- shaln align: option passthrough table (no duckdb needed) ---------------
+
+test_align_usage_lists_every_option() {
+  # The usage text is generated from shaln_align_opt_table, so every option in
+  # the table must appear in --help. Looping the table makes this fail loud if a
+  # row is ever added without the generator surfacing it.
+  local usage cf cp ck cs
+  usage="$("$SHALN" align --help 2>&1)"
+  # cp/ck/cs are read only to consume the remaining columns; only the flag (cf) is asserted.
+  # shellcheck disable=SC2034
+  while read -r cf cp ck cs; do
+    [[ -z "$cf" ]] && continue
+    assert_contains "$usage" "$cf" "usage lists $cf"
+  done <<EOF
+$(shaln_align_opt_table)
+EOF
+}
+
+test_build_align_params_minimap2_kinds() {
+  # Each kind emits its exact SQL form, in argument order: string -> quoted,
+  # uint -> bare, bool -> ':= true', num -> bare.
+  local out
+  out="$(shaln_build_align_params minimap2 --preset map-ont --match-score 3 --eqx --pri-ratio 0.5)"
+  assert_eq ", preset := 'map-ont', match_score := 3, eqx := true, pri_ratio := 0.5" "$out" \
+    "minimap2 passthrough emits exact name := value SQL per kind"
+}
+
+test_build_align_params_bowtie2_kinds() {
+  local out
+  out="$(shaln_build_align_params bowtie2 --local --score-min 'L,-0.6,-0.6' --seed 42 --no-mixed)"
+  assert_eq ", local := true, score_min := 'L,-0.6,-0.6', seed := 42, no_mixed := true" "$out" \
+    "bowtie2 passthrough emits exact name := value SQL (string is SQL-quoted)"
+}
+
+test_build_align_params_rejects_bad_value() {
+  local out rc
+  out="$(shaln_build_align_params minimap2 --match-score foo 2>&1)"
+  rc=$?
+  assert_rc 2 "$rc" "a non-numeric uint value is a usage error"
+  assert_contains "$out" "non-negative integer" "error explains the expected kind"
+}
+
+test_infer_format_extensions() {
+  assert_eq "sam" "$(shaln_infer_format out.sam)" ".sam -> sam"
+  assert_eq "sam" "$(shaln_infer_format out.sam.gz)" ".sam.gz -> sam"
+  assert_eq "sam" "$(shaln_infer_format out.sam.bgz)" ".sam.bgz -> sam"
+  assert_eq "bam" "$(shaln_infer_format out.bam)" ".bam -> bam"
+  assert_eq "parquet" "$(shaln_infer_format out.parquet)" ".parquet -> parquet"
+  assert_eq "parquet" "$(shaln_infer_format out.pq)" ".pq -> parquet"
+  assert_eq "arrow" "$(shaln_infer_format out.arrow)" ".arrow -> arrow"
+  assert_eq "sam" "$(shaln_infer_format weird)" "unknown ext defaults to sam"
+  assert_eq "sam" "$(shaln_infer_format '')" "empty path (stdout) defaults to sam"
+}
+
+test_infer_sam_compress() {
+  assert_eq "gzip" "$(shaln_infer_sam_compress out.sam.gz)" ".gz -> gzip"
+  assert_eq "gzip" "$(shaln_infer_sam_compress out.sam.bgz)" ".bgz -> gzip"
+  assert_eq "none" "$(shaln_infer_sam_compress out.sam)" ".sam -> none"
+  assert_eq "none" "$(shaln_infer_sam_compress '')" "stdout -> none"
+}
+
+test_build_align_params_rejects_aligner_mismatch() {
+  # A minimap2-only flag on a bowtie2 bundle (and vice-versa) fails loud, naming
+  # the aligner the flag actually belongs to.
+  local out rc
+  out="$(shaln_build_align_params minimap2 --local 2>&1)"
+  rc=$?
+  assert_rc 2 "$rc" "--local on a minimap2 bundle is rejected"
+  assert_contains "$out" "bowtie2" "error says --local is a bowtie2 option"
+  out="$(shaln_build_align_params bowtie2 --eqx 2>&1)"
+  rc=$?
+  assert_rc 2 "$rc" "--eqx on a bowtie2 bundle is rejected"
+  assert_contains "$out" "minimap2" "error says --eqx is a minimap2 option"
+}
+
 # --- shaln align: routing + alignment + output (need duckdb) ---------------
 
 test_align_minimap2_sam() {
@@ -571,7 +699,9 @@ test_align_minimap2_sam() {
   ensure_align_bundle_mm2
   local out
   out="$(new_bundle_dir)/aln.sam"
-  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 -o "$out"
+  # --recover-names: assert the ORIGINAL read names land in QNAME (default emits
+  # the integer sequence_index — see test_align_default_qname_is_sequence_index).
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 --recover-names -o "$out"
   assert_rc 0 "$CAP_RC" "minimap2 align to SAM succeeds ($CAP_OUT)"
   [[ -f "$out" ]] || _diag "SAM file not written"
   local body
@@ -583,12 +713,51 @@ test_align_minimap2_sam() {
   assert_eq "2" "$CAP_OUT" "exactly 2 mapped alignments in the SAM"
 }
 
+test_align_default_qname_is_sequence_index() {
+  require_duckdb_ext || return
+  ensure_align_bundle_mm2
+  # DEFAULT (no --recover-names): the QNAME is the integer sequence_index, NOT the
+  # read name — this is what keeps alignment fully streaming.
+  local out reads
+  out="$(new_bundle_dir)/aln.sam"
+  reads="$(new_bundle_dir)/reads.parquet"
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 \
+    --reads-cache "$reads" --include-seq-qual -o "$out"
+  assert_rc 0 "$CAP_RC" "default (no-recovery) align succeeds, incl. --include-seq-qual ($CAP_OUT)"
+  local body
+  body="$(grep -v '^@' "$out" 2>/dev/null)"
+  # QNAMEs are integers, and the original names do NOT appear.
+  assert_not_contains "$body" "readA" "default QNAME is not the read name"
+  printf '%s' "$body" | cut -f1 | grep -qE '^[0-9]+$' || _diag "default QNAME is not an integer sequence_index"
+  # --include-seq-qual still fills SEQ in default mode (keyed by sequence_index).
+  printf '%s' "$body" | cut -f10 | grep -qE 'ACGTACGT|TGCATGCA' || _diag "SEQ not written under default --include-seq-qual"
+  # The integer QNAMEs map back to the real names by joining on sequence_index
+  # against the (--reads-cache) reads parquet — the documented recovery path.
+  duckdb_query "SELECT string_agg(r.read_id || '->' || a.reference, ',' ORDER BY r.read_id)
+    FROM read_alignments('$out') a JOIN read_parquet('$reads') r ON a.read_id::BIGINT = r.sequence_index;"
+  assert_eq "readA->ref1,readB->ref2" "$CAP_OUT" "integer QNAMEs map back to names via sequence_index"
+}
+
+test_align_minimap2_passthrough_knob_accepted() {
+  require_duckdb_ext || return
+  ensure_align_bundle_mm2
+  # An M2 map-time knob routed through shaln's table must produce SQL the real
+  # extension accepts (guards against a wrong/typo'd param name in the table).
+  local out
+  out="$(new_bundle_dir)/aln.sam"
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" \
+    --max-secondary 0 --match-score 2 --bandwidth 500 -o "$out"
+  assert_rc 0 "$CAP_RC" "minimap2 passthrough knobs are accepted by the extension ($CAP_OUT)"
+  duckdb_query "SELECT count(*) FROM read_alignments('$out');"
+  assert_eq "2" "$CAP_OUT" "alignment still produces the 2 expected records with knobs set"
+}
+
 test_align_minimap2_bam_roundtrip() {
   require_duckdb_ext || return
   ensure_align_bundle_mm2
   local out
   out="$(new_bundle_dir)/aln.bam"
-  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 -o "$out"
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 --recover-names -o "$out"
   assert_rc 0 "$CAP_RC" "minimap2 align to BAM succeeds ($CAP_OUT)"
   duckdb_query "SELECT string_agg(read_id || '->' || reference, ',' ORDER BY read_id) FROM read_alignments('$out');"
   assert_eq "readA->ref1,readB->ref2" "$CAP_OUT" "BAM reads back the expected alignments"
@@ -605,14 +774,95 @@ test_align_parquet() {
   assert_eq "2" "$CAP_OUT" "2 mapped alignments in the Parquet"
 }
 
+test_align_parquet_is_zstd() {
+  require_duckdb_ext || return
+  ensure_align_bundle_mm2
+  # Point 6: parquet output must be zstd-compressed.
+  local out
+  out="$(new_bundle_dir)/aln.parquet"
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 --format parquet -o "$out"
+  assert_rc 0 "$CAP_RC" "parquet align succeeds ($CAP_OUT)"
+  duckdb_query "SELECT DISTINCT compression FROM parquet_metadata('$out');"
+  assert_eq "ZSTD" "$CAP_OUT" "every column chunk is ZSTD-coded"
+}
+
+test_align_sam_gz_output_is_gzip() {
+  require_duckdb_ext || return
+  ensure_align_bundle_mm2
+  # Point 6: a .sam.gz output path is inferred as SAM + gzip and produces a
+  # valid (BGZF) gzip stream that reads back correctly.
+  local out
+  out="$(new_bundle_dir)/aln.sam.gz"
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 -o "$out"
+  assert_rc 0 "$CAP_RC" "align to .sam.gz succeeds ($CAP_OUT)"
+  # gzip/BGZF magic bytes 0x1f 0x8b.
+  local magic
+  magic="$(head -c2 "$out" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  assert_eq "1f8b" "$magic" ".sam.gz begins with gzip magic 1f 8b"
+  # And it reads back as 2 alignments (proves it is a valid SAM, not garbage).
+  duckdb_query "SELECT count(*) FROM read_alignments('$out');"
+  assert_eq "2" "$CAP_OUT" "the gzipped SAM reads back as 2 alignments"
+}
+
+test_align_rejects_compress_on_nonsam() {
+  require_duckdb_ext || return
+  ensure_align_bundle_mm2
+  # --compress is SAM-only; using it with a non-SAM format is a usage error.
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" \
+    --format parquet --compress gzip -o "$(new_bundle_dir)/x.parquet"
+  assert_rc 2 "$CAP_RC" "--compress on parquet is rejected"
+  assert_contains "$CAP_OUT" "SAM" "error explains --compress is SAM-only"
+}
+
+test_rype_classify_unique_per_shard() {
+  require_duckdb_ext || return
+  # Point 7 invariant that justifies dropping SELECT DISTINCT: rype_classify
+  # scores at the bucket level, so even when a read matches multiple references
+  # (here two identical refs) and many chunks all mapping to ONE shard, it emits
+  # exactly one (read, shard) row. If this ever regresses, the DISTINCT removal
+  # would let duplicate routing rows through — so assert it directly.
+  local idx
+  idx="$(new_bundle_dir)/uniq.ryxdi"
+  local sql
+  sql="LOAD '$INT_EXT';
+CREATE TABLE refs AS
+  SELECT 1::BIGINT AS feature_idx, 'refP' AS read_id, 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCACGTACGTACGTACGTACGT' AS sequence1, 'shardP' AS shard_name
+  UNION ALL SELECT 2, 'refPb', 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCTTAAGGCCACGTACGTACGTACGTACGT', 'shardP';
+CREATE TABLE chunks AS WITH e AS (SELECT feature_idx, UNNEST(sequence_split(sequence1, 20)) AS c FROM refs)
+  SELECT feature_idx, c.chunk_index AS chunk_index, c.chunk_data AS chunk_data FROM e;
+CREATE TABLE mapping AS SELECT feature_idx, shard_name AS bucket_name FROM refs;
+CREATE TABLE sink AS SELECT status FROM rype_index_create('chunks', '$idx', mapping_table := 'mapping', k := 16, w := 8);
+CREATE TABLE reads AS SELECT 'readP' AS read_id, 'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTGGCCTTAAGGCCTTAAGGCCTTAAGGCCTT' AS sequence1;
+SELECT count(*) = count(DISTINCT (read_id, bucket_name)) AND count(*) > 0 FROM rype_classify('$idx', 'reads', id_column := 'read_id');"
+  CAP_OUT="$(printf '.bail on\n%s\n' "$sql" | "$INT_DUCKDB" -unsigned -noheader -list 2>&1)"
+  CAP_RC=$?
+  assert_rc 0 "$CAP_RC" "rype stress index/classify runs ($CAP_OUT)"
+  assert_eq "true" "$CAP_OUT" "rype_classify emits unique (read, shard) rows (>=1, no dupes)"
+}
+
 test_align_stdout_sam_default() {
   require_duckdb_ext || return
   ensure_align_bundle_mm2
   # No -o -> SAM streamed to stdout.
-  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 --recover-names
   assert_rc 0 "$CAP_RC" "align to stdout succeeds"
   assert_contains "$CAP_OUT" "@SQ" "stdout SAM has a header (@SQ lines)"
   assert_contains "$CAP_OUT" "readA" "stdout SAM has alignments"
+}
+
+test_align_stdin_reads_input() {
+  require_duckdb_ext || return
+  ensure_align_bundle_mm2
+  # Reads fed on stdin ('--fasta -') must work end-to-end: shaln passes its SQL via
+  # a temp file (-f) so stdin stays free for the data stream (read as /dev/stdin).
+  local out
+  out="$(new_bundle_dir)/aln.bam"
+  CAP_OUT="$(SHALN_DUCKDB="$INT_DUCKDB" SHALN_EXTENSION_PATH="$INT_EXT" "$SHALN" align \
+    --bundle "$ALIGN_BUNDLE_MM2" --fasta - --max-secondary 0 --recover-names -o "$out" <"$FIX/align_reads.fa" 2>&1)"
+  CAP_RC=$?
+  assert_rc 0 "$CAP_RC" "stdin reads align succeeds ($CAP_OUT)"
+  duckdb_query "SELECT string_agg(read_id || '->' || reference, ',' ORDER BY read_id) FROM read_alignments('$out');"
+  assert_eq "readA->ref1,readB->ref2" "$CAP_OUT" "stdin-fed reads align with recovered names"
 }
 
 test_align_broadcast_routing() {
@@ -620,7 +870,7 @@ test_align_broadcast_routing() {
   ensure_align_bundle_mm2
   local out
   out="$(new_bundle_dir)/aln.bam"
-  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --broadcast --max-secondary 0 -o "$out"
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --broadcast --max-secondary 0 --recover-names -o "$out"
   assert_rc 0 "$CAP_RC" "broadcast routing succeeds ($CAP_OUT)"
   duckdb_query "SELECT string_agg(read_id || '->' || reference, ',' ORDER BY read_id) FROM read_alignments('$out');"
   assert_eq "readA->ref1,readB->ref2" "$CAP_OUT" "broadcast yields the same correct alignments"
@@ -632,8 +882,8 @@ test_align_include_seq_qual() {
   local out_no out_yes
   out_no="$(new_bundle_dir)/no.sam"
   out_yes="$(new_bundle_dir)/yes.sam"
-  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 -o "$out_no"
-  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 --include-seq-qual -o "$out_yes"
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 --recover-names -o "$out_no"
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 --recover-names --include-seq-qual -o "$out_yes"
   # Without the flag, SEQ is '*'; with it, SEQ is the actual read sequence.
   local seq_no seq_yes
   seq_no="$(grep '^readA' "$out_no" 2>/dev/null | cut -f10)"
@@ -668,11 +918,26 @@ test_align_bowtie2() {
   ensure_align_bundle_bt2
   local out
   out="$(new_bundle_dir)/aln.bam"
-  shaln_int align --bundle "$ALIGN_BUNDLE_BT2" --fasta "$FIX/align_reads.fa" -o "$out"
+  shaln_int align --bundle "$ALIGN_BUNDLE_BT2" --fasta "$FIX/align_reads.fa" --recover-names -o "$out"
   assert_rc 0 "$CAP_RC" "bowtie2 align succeeds ($CAP_OUT)"
   duckdb_query "SELECT string_agg(DISTINCT read_id || '->' || reference, ',') FROM read_alignments('$out');"
   assert_contains "$CAP_OUT" "readA->ref1" "bowtie2: readA maps to ref1"
   assert_contains "$CAP_OUT" "readB->ref2" "bowtie2: readB maps to ref2"
+}
+
+test_align_bowtie2_passthrough_knob_accepted() {
+  require_duckdb_ext || return
+  gpl_boundary_ready || {
+    skip "bowtie2_available() is false (gpl-boundary absent)"
+    return
+  }
+  ensure_align_bundle_bt2
+  # A bowtie2 passthrough flag routed through shaln's table must produce SQL the
+  # gpl-boundary daemon accepts (guards the bowtie2 param names in the table).
+  local out
+  out="$(new_bundle_dir)/aln.bam"
+  shaln_int align --bundle "$ALIGN_BUNDLE_BT2" --fasta "$FIX/align_reads.fa" --local --seed 7 -o "$out"
+  assert_rc 0 "$CAP_RC" "bowtie2 passthrough knobs are accepted by the daemon ($CAP_OUT)"
 }
 
 test_align_rejects_bad_threshold() {
@@ -720,6 +985,136 @@ test_align_verbose_layers() {
     --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 -o "$out" 2>&1 1>/dev/null)"
   assert_not_contains "$err" "aligning against bundle" "non-verbose emits no Layer-1 milestones"
   assert_not_contains "$err" "[minimap2]" "non-verbose emits no Layer-2 progress"
+}
+
+# --- S4: streaming model + BIGINT routing ----------------------------------
+
+# shaln_dump <args...> — capture the SQL shaln WOULD run (SHALN_DUMP_SQL), without
+# executing it, into CAP_OUT. Needs a real duckdb (binary check) + bundle.
+shaln_dump() {
+  CAP_OUT="$(SHALN_DUMP_SQL=1 SHALN_DUCKDB="$INT_DUCKDB" SHALN_EXTENSION_PATH="$INT_EXT" "$SHALN" "$@" 2>/dev/null)"
+  CAP_RC=$?
+}
+
+test_align_default_streams_no_readscale_tables() {
+  require_duckdb_ext || return
+  ensure_align_bundle_mm2
+  # Default mode: reads + routing are views over zstd parquet; the alignment is
+  # streamed into the COPY. NO read/output-scale CREATE TABLE may exist.
+  shaln_dump align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa"
+  assert_rc 0 "$CAP_RC" "dump succeeds ($CAP_OUT)"
+  assert_not_contains "$CAP_OUT" "TABLE __shaln_aln" "no __shaln_aln materialization (streamed into COPY)"
+  assert_not_contains "$CAP_OUT" "TABLE __shaln_src" "reads are a view, not a RAM table"
+  assert_not_contains "$CAP_OUT" "TABLE __shaln_r2s" "routing is a view, not a RAM table"
+  assert_contains "$CAP_OUT" "VIEW __shaln_src" "reads exposed as a view"
+  assert_contains "$CAP_OUT" "VIEW __shaln_r2s" "routing exposed as a view"
+  assert_contains "$CAP_OUT" "FORMAT PARQUET, COMPRESSION 'zstd'" "reads/routing converted to zstd parquet"
+  # Default = no name recovery: the QNAME is the BIGINT key, so NO recovery join.
+  assert_not_contains "$CAP_OUT" "nm.read_id AS read_id" "default does not add the read-scale name-recovery join"
+  # --recover-names opts into the join.
+  shaln_dump align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --recover-names
+  assert_contains "$CAP_OUT" "nm.read_id AS read_id" "--recover-names adds the name-recovery join"
+}
+
+test_align_in_memory_uses_tables() {
+  require_duckdb_ext || return
+  ensure_align_bundle_mm2
+  # --in-memory holds reads + routing in RAM tables (no parquet round-trip).
+  shaln_dump align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --in-memory
+  assert_rc 0 "$CAP_RC" "dump succeeds ($CAP_OUT)"
+  assert_contains "$CAP_OUT" "TABLE __shaln_src" "--in-memory reads are a RAM table"
+  assert_contains "$CAP_OUT" "TABLE __shaln_r2s" "--in-memory routing is a RAM table"
+  assert_not_contains "$CAP_OUT" "TABLE __shaln_aln" "still no __shaln_aln (streamed into COPY)"
+}
+
+test_index_default_streams_refs() {
+  require_duckdb_ext || return
+  # Default: references become a view over a zstd parquet; derived relations too.
+  shaln_dump index --references "$FIX/refs.fasta" --shard-map "$FIX/shard-map.tsv" -o "$(new_bundle_dir)"
+  assert_rc 0 "$CAP_RC" "index dump succeeds ($CAP_OUT)"
+  assert_contains "$CAP_OUT" "VIEW __shaln_refs" "references exposed as a view"
+  assert_not_contains "$CAP_OUT" "TABLE __shaln_refs" "references are not a RAM table by default"
+  assert_contains "$CAP_OUT" "VIEW __shaln_mapped" "derived __shaln_mapped is a view"
+  # --in-memory holds references in a RAM table.
+  shaln_dump index --references "$FIX/refs.fasta" --shard-map "$FIX/shard-map.tsv" -o "$(new_bundle_dir)" --in-memory
+  assert_contains "$CAP_OUT" "TABLE __shaln_refs" "--in-memory references are a RAM table"
+}
+
+test_align_in_memory_result_invariance() {
+  require_duckdb_ext || return
+  ensure_align_bundle_mm2
+  # --in-memory must produce the SAME alignments as the streaming default.
+  local out
+  out="$(new_bundle_dir)/aln.bam"
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 --in-memory --recover-names -o "$out"
+  assert_rc 0 "$CAP_RC" "--in-memory align succeeds ($CAP_OUT)"
+  duckdb_query "SELECT string_agg(read_id || '->' || reference, ',' ORDER BY read_id) FROM read_alignments('$out');"
+  assert_eq "readA->ref1,readB->ref2" "$CAP_OUT" "--in-memory yields the same alignments + recovered names"
+}
+
+test_align_reads_cache_persists_normalized_parquet() {
+  require_duckdb_ext || return
+  ensure_align_bundle_mm2
+  # --reads-cache persists the normalized reads parquet; it carries the 6-column
+  # schema with a UNIQUE BIGINT sequence_index, and is zstd-coded.
+  local cache
+  cache="$(new_bundle_dir)/reads.parquet"
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 --reads-cache "$cache" -o "$(new_bundle_dir)/a.sam"
+  assert_rc 0 "$CAP_RC" "align with --reads-cache succeeds ($CAP_OUT)"
+  [[ -f "$cache" ]] || _diag "--reads-cache parquet not persisted at '$cache'"
+  duckdb_query "SELECT string_agg(column_name, ',') FROM (DESCRIBE SELECT * FROM read_parquet('$cache'));"
+  assert_eq "sequence_index,read_id,sequence1,sequence2,qual1,qual2" "$CAP_OUT" "cached reads have the normalized 6-col schema"
+  duckdb_query "SELECT count(*) = count(DISTINCT sequence_index) AND count(*) > 0 FROM read_parquet('$cache');"
+  assert_eq "true" "$CAP_OUT" "cached reads have a unique BIGINT sequence_index key"
+  duckdb_query "SELECT DISTINCT compression FROM parquet_metadata('$cache');"
+  assert_eq "ZSTD" "$CAP_OUT" "cached reads parquet is zstd-coded"
+}
+
+test_align_save_routing_keyed_by_sequence_index() {
+  require_duckdb_ext || return
+  ensure_align_bundle_mm2
+  # --save-routing writes the read->shard map as parquet, keyed by the BIGINT
+  # sequence_index (column named read_id, type BIGINT — not the read name).
+  local route
+  route="$(new_bundle_dir)/routing.parquet"
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 --save-routing "$route" -o "$(new_bundle_dir)/a.sam"
+  assert_rc 0 "$CAP_RC" "align with --save-routing succeeds ($CAP_OUT)"
+  [[ -f "$route" ]] || _diag "--save-routing parquet not written at '$route'"
+  duckdb_query "SELECT column_name || ':' || column_type FROM (DESCRIBE SELECT * FROM read_parquet('$route')) ORDER BY column_name;"
+  assert_contains "$CAP_OUT" "read_id:BIGINT" "routing key is the BIGINT sequence_index (column read_id)"
+  assert_contains "$CAP_OUT" "shard_name:VARCHAR" "routing carries the shard name"
+}
+
+test_align_parquet_input_requires_unique_sequence_index() {
+  require_duckdb_ext || return
+  ensure_align_bundle_mm2
+  local dir dup nokey
+  dir="$(new_bundle_dir)"
+  dup="$dir/dup.parquet"
+  nokey="$dir/nokey.parquet"
+  # A parquet whose sequence_index repeats (e.g. a UNION of two sources).
+  "$INT_DUCKDB" -unsigned -c "LOAD '$INT_EXT'; COPY (SELECT * FROM read_fastx('$FIX/reads_se.fq') UNION ALL BY NAME SELECT * FROM read_fastx('$FIX/reads_se.fq')) TO '$dup' (FORMAT PARQUET);" >/dev/null 2>&1
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --parquet "$dup" -o "$dir/a.sam"
+  assert_ne 0 "$CAP_RC" "a non-unique sequence_index is rejected"
+  assert_contains "$CAP_OUT" "UNIQUE" "error explains sequence_index must be unique"
+  # A parquet with no sequence_index column at all.
+  "$INT_DUCKDB" -unsigned -c "LOAD '$INT_EXT'; COPY (SELECT read_id, sequence1, sequence2, qual1, qual2 FROM read_fastx('$FIX/reads_se.fq')) TO '$nokey' (FORMAT PARQUET);" >/dev/null 2>&1
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --parquet "$nokey" -o "$dir/b.sam"
+  assert_ne 0 "$CAP_RC" "a missing sequence_index column is rejected"
+  assert_contains "$CAP_OUT" "sequence_index" "error names the missing key column"
+}
+
+test_align_reads_cache_default_cleans_up() {
+  require_duckdb_ext || return
+  ensure_align_bundle_mm2
+  # Without --reads-cache, the converted reads parquet is a temp file removed on
+  # exit: no shaln-reads.* scratch should survive in TMPDIR after the run.
+  local before after
+  before="$(ls "${TMPDIR:-/tmp}"/shaln-reads.* 2>/dev/null | wc -l | tr -d ' ')"
+  shaln_int align --bundle "$ALIGN_BUNDLE_MM2" --fasta "$FIX/align_reads.fa" --max-secondary 0 -o "$(new_bundle_dir)/a.sam"
+  assert_rc 0 "$CAP_RC" "align succeeds ($CAP_OUT)"
+  after="$(ls "${TMPDIR:-/tmp}"/shaln-reads.* 2>/dev/null | wc -l | tr -d ' ')"
+  assert_eq "$before" "$after" "temp reads parquet is cleaned up on exit (no leftover shaln-reads.*)"
 }
 
 # --- install.sh: platform detection + URL (no network) ---------------------
@@ -797,6 +1192,9 @@ main() {
     test_resolve_duckdb_missing_fails \
     test_require_duckdb_rejects_old_version \
     test_require_duckdb_accepts_good_version \
+    test_require_bowtie2_available_proceeds \
+    test_require_bowtie2_auto_installs_then_succeeds \
+    test_require_bowtie2_persistent_failure_is_friendly \
     test_index_requires_references \
     test_index_requires_shard_map \
     test_index_requires_output \
@@ -823,17 +1221,40 @@ main() {
     test_reads_schema_columns \
     test_align_requires_bundle \
     test_align_requires_input \
+    test_align_usage_lists_every_option \
+    test_build_align_params_minimap2_kinds \
+    test_build_align_params_bowtie2_kinds \
+    test_infer_format_extensions \
+    test_infer_sam_compress \
+    test_build_align_params_rejects_bad_value \
+    test_build_align_params_rejects_aligner_mismatch \
     test_align_minimap2_sam \
+    test_align_default_qname_is_sequence_index \
+    test_align_minimap2_passthrough_knob_accepted \
+    test_align_parquet_is_zstd \
+    test_align_sam_gz_output_is_gzip \
+    test_align_rejects_compress_on_nonsam \
+    test_rype_classify_unique_per_shard \
     test_align_minimap2_bam_roundtrip \
     test_align_parquet \
     test_align_stdout_sam_default \
+    test_align_stdin_reads_input \
     test_align_broadcast_routing \
     test_align_include_seq_qual \
     test_align_arrow_stdout \
     test_align_bowtie2 \
+    test_align_bowtie2_passthrough_knob_accepted \
     test_align_rejects_bad_threshold \
     test_align_rejects_corrupt_manifest \
     test_align_verbose_layers \
+    test_align_default_streams_no_readscale_tables \
+    test_align_in_memory_uses_tables \
+    test_index_default_streams_refs \
+    test_align_in_memory_result_invariance \
+    test_align_reads_cache_persists_normalized_parquet \
+    test_align_save_routing_keyed_by_sequence_index \
+    test_align_parquet_input_requires_unique_sequence_index \
+    test_align_reads_cache_default_cleans_up \
     test_install_asset_macos \
     test_install_asset_linux \
     test_install_asset_unknown_fails \

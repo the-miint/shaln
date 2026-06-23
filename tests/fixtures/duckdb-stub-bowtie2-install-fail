@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Test fixture: a fake `duckdb` where bowtie2 is unavailable and the auto-install
+# of gpl-boundary fails (e.g. no network / no curl). Every bowtie2_available()
+# check returns false, so shaln_require_bowtie2 must exhaust the install attempt
+# and die with its friendly, DuckDB-agnostic message.
+case " $* " in
+*' --version '*)
+  echo "v1.5.4 (Variegata) 08e34c447b"
+  exit 0
+  ;;
+esac
+sql="$(cat)"
+case "$sql" in
+*install_gpl_boundary*)
+  echo "install_gpl_boundary: 'curl' not found on PATH; cannot download gpl-boundary"
+  ;;
+*bowtie2_available*)
+  echo "false"
+  ;;
+esac

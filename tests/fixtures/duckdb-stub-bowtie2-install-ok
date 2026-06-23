@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Test fixture: a fake `duckdb` that simulates the auto-install recovery path.
+# bowtie2 is initially unavailable; once `install_gpl_boundary()` has been run it
+# becomes available. The "did the install run" state lives in a file
+# ($SHALN_STUB_STATE) so the cross-process re-check is exercised exactly as it
+# is in production: bowtie2_available() is memoized within a duckdb process, so
+# shaln MUST re-check in a fresh process. The state file flips false->true only
+# across separate invocations, mirroring that memoization.
+case " $* " in
+*' --version '*)
+  echo "v1.5.4 (Variegata) 08e34c447b"
+  exit 0
+  ;;
+esac
+state="${SHALN_STUB_STATE:-${TMPDIR:-/tmp}/shaln-stub-install-ok.state}"
+sql="$(cat)"
+case "$sql" in
+*install_gpl_boundary*)
+  : >"$state" # mark gpl-boundary as installed
+  echo "Installed gpl-boundary 0.4.2 to /cache/miint/bin/gpl-boundary"
+  ;;
+*bowtie2_available*)
+  if [[ -f "$state" ]]; then echo "true"; else echo "false"; fi
+  ;;
+esac

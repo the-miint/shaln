@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Test fixture: a fake `duckdb` where bowtie2 is already available, so
+# shaln_require_bowtie2 should proceed without attempting an install. Inspects
+# the piped SQL and answers `bowtie2_available()` with `true`; it never sees an
+# install query on the happy path. Reads stdin only for SQL queries.
+case " $* " in
+*' --version '*)
+  echo "v1.5.4 (Variegata) 08e34c447b"
+  exit 0
+  ;;
+esac
+sql="$(cat)"
+case "$sql" in
+*bowtie2_available*) echo "true" ;;
+*install_gpl_boundary*) echo "Installed gpl-boundary (unexpected on the available path)" ;;
+esac
